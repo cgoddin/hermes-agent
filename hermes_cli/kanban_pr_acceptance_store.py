@@ -2,12 +2,22 @@
 from __future__ import annotations
 
 from hermes_cli.kanban_db_connect import write_txn
-from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
+from hermes_cli.kanban_pr_acceptance import _PR, _PR_SHORT, canonical_pr_url, collect_acceptance
 
 
 def _snapshot(conn, task_id):
     row = conn.execute("SELECT current_run_id, status, completion_contract FROM tasks WHERE id=?", (task_id,)).fetchone()
     return tuple(row) if row else None
+
+
+def _declared_pr_url(published_pr):
+    """Both canonical published_pr forms -> full URL (None if not a PR ref)."""
+    if not isinstance(published_pr, str):
+        return None
+    short = _PR_SHORT.fullmatch(published_pr.strip())
+    if short:
+        return f"https://github.com/{short[1]}/pull/{short[2]}"
+    return published_pr.strip() if _PR.fullmatch(published_pr.strip()) else None
 
 
 def prepare_acceptance(conn, task_id, expected_run_id, metadata):
@@ -20,15 +30,15 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
-    match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
+    pr_url = _declared_pr_url(published_pr)
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
+    if pr_url and contract == _PR.fullmatch(pr_url)[1]:
         with write_txn(conn):
             if _snapshot(conn, task_id) != snapshot:
                 return False
-            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
-        contract = published_pr
+            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (pr_url, task_id))
+        snapshot = (run_id, status, pr_url)
+        contract = pr_url
     return snapshot, collect_acceptance(contract, published_pr)
 
 
