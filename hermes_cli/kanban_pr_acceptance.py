@@ -3,7 +3,7 @@
 Network work happens outside SQLite transactions. The lifecycle owner persists
 receipts only after rechecking the captured run/status/contract under its lock.
 
-Fork note (WeatherMan, 2026-09-15): the cgoddin PAT cannot read
+Note (2026-09-15): a scoped PAT cannot read
 ``baseRef.branchProtectionRule`` (GraphQL FORBIDDEN). The old gate treated any
 GraphQL error as an infra failure and wedged every PR-completion. Now:
 - the GraphQL error on that field is NO-SIGNAL (not an acceptance failure);

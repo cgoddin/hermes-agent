@@ -24,7 +24,7 @@ def github(tmp_path, monkeypatch):
             if self.path == "/graphql":
                 pr = {"headRefOid": sha, "baseRefName": "main", "state": "OPEN" if state["pr_state"] == "open" else "MERGED"}
                 if state.get("forbid_protection"):
-                    # Model the real cgoddin PAT: data present, scoped FORBIDDEN error.
+                    # Model a real scoped PAT: data present, FORBIDDEN error.
                     value = {"data": {"repository": {"pullRequest": {**pr, "baseRef": None}}},
                              "errors": [{"type": "FORBIDDEN",
                                          "path": ["repository", "pullRequest", "baseRef", "branchProtectionRule"],
@@ -163,7 +163,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
 
 @pytest.mark.linux_only
 def test_forbidden_branch_protection_is_no_signal_and_merged_pr_is_accepted(github):
-    """The cgoddin-PAT wedge: scoped GraphQL FORBIDDEN must not fail acceptance,
+    """The scoped-PAT wedge: GraphQL FORBIDDEN must not fail acceptance,
     and a REST-verified merged PR with zero required checks completes natively."""
     with connect() as conn:
         # Merged PR, no repo-required checks, GraphQL protection FORBIDDEN.
