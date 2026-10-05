@@ -83,7 +83,7 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+(?:(?:[/?#A-Za-z]|\.[A-Za-z])[^\s<>\"')\]]*)?",
     re.IGNORECASE,
 )
 
@@ -1522,6 +1522,77 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _is_merged_parent_pr(conn: sqlite3.Connection, task_id: str, url: str,
+                         assignee: Optional[str], *, created_at: int, now: int) -> bool:
+    """Only native, independently reviewed parent publication can be background context."""
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    match = acceptance._PR.fullmatch(url)
+    if not match or not assignee or created_at > now:
+        return False
+    # A shared URL is still this child's publication if its own run recorded it.
+    own_runs = conn.execute("SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,))
+    if any(_kb._json_dict(run["metadata"]).get("published_pr") == url for run in own_runs):
+        return False
+    parents = conn.execute(
+        "SELECT r.id, r.task_id, r.started_at, r.metadata FROM task_links l "
+        "JOIN tasks child ON child.id = l.child_id "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "JOIN task_runs r ON r.id = (SELECT id FROM task_runs WHERE task_id = p.id "
+        "ORDER BY id DESC LIMIT 1) "
+        "WHERE l.child_id = ? AND p.status = 'done' AND p.assignee = 'devops' "
+        "AND r.profile = 'devops' AND r.status = 'done' "
+        "AND r.outcome = 'completed' AND r.started_at < r.ended_at "
+        "AND r.ended_at < ? AND r.ended_at <= ? "
+        # The child may predate the merge, but must predate its own comment.
+        "AND child.created_at < ? AND child.created_at <= ?",
+        (task_id, created_at, now, created_at, now),
+    ).fetchall()
+    for parent in parents:
+        metadata = _kb._json_dict(parent["metadata"])
+        head, merge = metadata.get("head"), metadata.get("merge_commit")
+        if (metadata.get("published_pr") != url
+                or metadata.get("review_outcome") != "approved_and_merged_dev"
+                or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                or not isinstance(merge, str) or not re.fullmatch(r"[0-9a-f]{40}", merge)):
+            continue
+        developer = conn.execute(
+            "SELECT r.id, r.profile, r.status, r.outcome, r.started_at, r.ended_at, r.metadata FROM task_runs r "
+            "WHERE r.task_id = ? AND r.id < ? "
+            "ORDER BY r.id DESC LIMIT 1",
+            (parent["task_id"], parent["id"]),
+        ).fetchone()
+        if (developer is None or developer["profile"] != "developer"
+                or developer["status"] != "review" or developer["outcome"] != "review_requested"
+                or developer["started_at"] is None or developer["ended_at"] is None
+                or not developer["started_at"] < developer["ended_at"] < parent["started_at"]):
+            continue
+        published = _kb._json_dict(developer["metadata"])
+        if (published.get("published_pr") != url
+                or published.get("head") != head):
+            continue
+        handoff = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'review_requested' AND created_at >= ? AND created_at < ? "
+            "ORDER BY id DESC LIMIT 1",
+            (parent["task_id"], developer["id"], developer["ended_at"], parent["started_at"]),
+        ).fetchone()
+        provenance = _kb._json_dict(handoff["payload"]) if handoff else {}
+        if provenance.get("implementer") != "developer" or provenance.get("reviewer") != "devops":
+            continue
+        try:
+            home = acceptance._assignee_profile_home(assignee)
+            current = acceptance._api(f"repos/{match[1]}/pulls/{match[2]}", profile_home=home)
+            return (current["state"] == "closed" and current["merged"] is True
+                    and current["head"]["sha"] == head and current["merge_commit_sha"] == merge)
+        except (acceptance._GateAuthError, OSError, subprocess.SubprocessError,
+                ValueError, KeyError, TypeError, IndexError):
+            # Missing credentials or incomplete/currently different evidence must
+            # never turn a duplicate-work guard into permission to spawn.
+            return False
+    return False
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1544,7 +1615,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1620,26 +1691,40 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
+    #    An authenticated, independently merged parent PR is context, not this
+    #    card's publication. Every other URL still guards, even in the same comment.
+    #    Exception: a handoff AFTER the newest blocking PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    merged_parents: dict[tuple[str, int], bool] = {}
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        urls = _RESPAWN_GUARD_PR_URL_RE.findall(body) if body else []
+        if urls and c["created_at"] > now:
+            return "active_pr"
+        blocking = False
+        for url in urls:
+            key = (url, c["created_at"])
+            if key not in merged_parents:
+                merged_parents[key] = _is_merged_parent_pr(
+                    conn, task_id, url, row["assignee"], created_at=c["created_at"], now=now)
+            if not merged_parents[key]:
+                blocking = True
+        if not blocking:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
+            "WHERE task_id = ? AND created_at > ? AND created_at <= ? "
             "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            (task_id, int(c["created_at"] or 0), now),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
