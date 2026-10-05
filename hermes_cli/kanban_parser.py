@@ -205,6 +205,8 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--acceptance-spec", metavar="JSON",
+             help="Version 1 CI spec frozen at creation: repo, base_branch, workflows (path/id/event/jobs/name/steps)."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -219,6 +221,13 @@ _SPECS = [
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    _cmd("register-acceptance", [
+        _TASK_ID,
+        _arg("--contract", required=True, metavar="JSON",
+             help="Once-only version 1 contract snapshot: source(kind/id/revision) and acceptance_spec. Must precede any evaluation."),
+        _arg("--pr", help="Exact GitHub PR URL for an OWNER/REPO completion contract; repo/base are verified."),
+        _json_flag(),
+    ], help="Register frozen task/project Actions expectations for an existing unevaluated PR card"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",
