@@ -23,14 +23,24 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          # GitHub event data, not PR-controlled shell source. A PR may target
+          # dev even when the fork's main has unrelated history.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          set -e
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            MERGE_BASE=$(git merge-base "$PR_BASE_SHA" HEAD)
+          else
+            # Push and manual/release runs still inspect the newest commit.
+            MERGE_BASE=$(git rev-parse HEAD^)
+          fi
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Keep the actual name/email pair; an email alone cannot establish
+          # that a commit came from our fork-local Hermes automation.
+          NEW_AUTHORS=$(git log "${MERGE_BASE}..HEAD" --format='%an%x09%ae' --no-merges | sort -u)
 
-          if [ -z "$NEW_EMAILS" ]; then
+          if [ -z "$NEW_AUTHORS" ]; then
             echo "No new commits to check."
             echo "review_status=[]" >> "$GITHUB_OUTPUT"
             echo "review_status=[]" > review-status.json
@@ -41,8 +51,17 @@ jobs:
           # (one file per email — conflict-free) or an entry in the frozen
           # legacy AUTHOR_MAP in scripts/releases/authors_legacy.py.
           MISSING=""
-          while IFS= read -r email; do
-            # Skip teknium and bot emails
+          while IFS=$'\t' read -r author email; do
+            # These exact name/email pairs identify local Hermes automation
+            # on our owned fork, not human GitHub contributors. Do not widen
+            # this to arbitrary localhost authors or other repositories.
+            if [ "$GITHUB_REPOSITORY" = "cgoddin/hermes-agent" ]; then
+              if { [ "$author" = "Hermes Developer" ] && [ "$email" = "developer@localhost" ]; } ||
+                 { [ "$author" = "Hermes DevOps" ] && [ "$email" = "devops@localhost" ]; }; then
+                continue
+              fi
+            fi
+            # Preserve existing human and bot attribution rules.
             case "$email" in
               *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
                 continue ;;
@@ -57,10 +76,9 @@ jobs:
             fi
 
             if ! grep -qF "\"${email}\"" scripts/releases/authors_legacy.py 2>/dev/null; then
-              AUTHOR=$(git log --author="$email" --format='%an' -1)
-              MISSING="${MISSING}\n  ${email} (${AUTHOR})"
+              MISSING="${MISSING}\n  ${email} (${author})"
             fi
-          done <<< "$NEW_EMAILS"
+          done <<< "$NEW_AUTHORS"
 
           if [ -n "$MISSING" ]; then
             echo ""
