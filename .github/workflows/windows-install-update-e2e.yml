@@ -29,7 +29,7 @@ jobs:
     name: Windows install.ps1 + hermes update E2E
     runs-on: ${{ github.repository == 'cgoddin/hermes-agent' && 'windows-latest' || 'windows-latest-32-core' }}
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 50
+    timeout-minutes: ${{ github.repository == 'cgoddin/hermes-agent' && 180 || 50 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -60,8 +60,10 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          # Keep every journey, but serialize installs on the fork's standard
+          # Windows runner: six simultaneous PM toolchain installs starve each
+          # other past the per-journey 1500s deadline.
+          HERMES_TEST_WORKERS: ${{ github.repository == 'cgoddin/hermes-agent' && '1' || '6' }}
           HERMES_TEST_FILE_TIMEOUT: '2400'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
