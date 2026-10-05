@@ -10,10 +10,12 @@ org's private repos (#122689).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -33,6 +35,7 @@ def _endpoint_label(endpoint: str) -> str:
         return "graphql"
     for pattern, label in (
         (r"repos/[^/]+/[^/]+/rules/branches/[^/]+", "repos/<owner>/<repo>/rules/branches/<branch>"),
+        (r"repos/[^/]+/[^/]+/branches/[^/]+(?:/protection)?", "repos/<owner>/<repo>/branches/<branch>/protection"),
         (r"repos/[^/]+/[^/]+/commits/[^/]+/(check-runs|statuses)", "repos/<owner>/<repo>/commits/<sha>/checks"),
         (r"repos/[^/]+/[^/]+/pulls/[0-9]+", "repos/<owner>/<repo>/pulls/<number>"),
     ):
@@ -184,9 +187,10 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
-                       assignee: str | None = None) -> dict:
+                       assignee: str | None = None, *, acceptance_spec=None) -> dict:
+    from hermes_cli.kanban_pr_actions import _PolicyCapabilityHold
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": None, "checks": [], "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -199,6 +203,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
             return receipt
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
+        if acceptance_spec is not None:
+            from hermes_cli.kanban_acceptance_spec import normalize_acceptance_spec
+            from hermes_cli.kanban_pr_actions import collect_actions
+            frozen = normalize_acceptance_spec(acceptance_spec, contract)
+            spec = json.loads(frozen)
+            receipt["spec_digest"] = hashlib.sha256(frozen.encode("utf-8")).hexdigest()
+            def api(endpoint, *, paginate=False):
+                return _api(endpoint, paginate=paginate, profile_home=profile_home)
+            return collect_actions(api, spec, repo, number, receipt)
         owner, name = repo.split("/")
         query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
@@ -248,9 +261,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 classification = _classify(check, sha, outcome, is_run)
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome if outcome in {
+                        "success", "failure", "error", "pending", "cancelled", "timed_out",
+                        "action_required", "neutral", "skipped", "stale", None} else "unknown"})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
@@ -258,6 +272,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
+        return receipt
+    except _PolicyCapabilityHold as exc:
+        receipt.update(classification="capability", hold=True,
+                       detail=f"GitHub required-policy capability HOLD ({exc}); protection/rules evidence is unavailable. "
+                              "Restore policy-read access before retrying; green Actions cannot waive unknown required checks.")
         return receipt
     except _GateAuthError as exc:
         login = f"assignee profile {_profile_label(assignee)}'s gh login" if assignee else "the ambient gh login"
