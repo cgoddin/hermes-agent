@@ -2,6 +2,7 @@
 import json
 import subprocess
 import time
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
+from hermes_cli import kanban_db_parent_pr as parent_pr
 from hermes_cli import kanban_pr_acceptance as acceptance
 from hermes_cli.kanban_db_connect import connect
 
@@ -31,8 +33,10 @@ def github(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "synthetic-ambient")
     state = {"pr": {"state": "closed", "merged": True, "head": {"sha": HEAD},
                     "merge_commit_sha": MERGE}, "calls": [], "error": None,
-             "now": int(time.time())}
+             "now": int(time.time()), "monotonic": 1000.0}
     monkeypatch.setattr(time, "time", lambda: state["now"])
+    monkeypatch.setattr(parent_pr, "time", SimpleNamespace(monotonic=lambda: state["monotonic"]))
+    monkeypatch.setattr(parent_pr, "_VERIFIED_PRS", OrderedDict())
 
     def run(command, **kwargs):
         assert command == ["gh", "api", "repos/synthetic/project/pulls/7", "--hostname", "github.com"]
@@ -50,12 +54,44 @@ def github(tmp_path, monkeypatch):
     return state
 
 
-def _native_parent(conn, clock):
+def _assert_guard_and_tick(conn, child, *, allowed, board=None):
+    assert dispatch.check_respawn_guard(conn, child) == (None if allowed else "active_pr")
+    result = dispatch.dispatch_once(conn, dry_run=True, board=board)
+    assert (child in [tid for tid, _, _ in result.spawned]) is allowed
+    return result
+
+
+def _assert_tick_reads(conn, child, github, *, allowed=True, reads=0, board=None):
+    before = len(github["calls"])
+    result = _assert_guard_and_tick(conn, child, allowed=allowed, board=board)
+    assert len(github["calls"]) - before == reads
+    if not allowed and kb.get_task(conn, child).status == "ready":
+        assert dict(result.respawn_guarded)[child] == "active_pr"
+
+
+def _update_run_metadata(conn, run_id, values):
+    metadata = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()[0])
+    metadata.update(values)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run_id))
+
+
+def _native_parent(conn, clock, *, early_comment=False, check_pending=False):
     now = clock["now"]
     clock["now"] = now - 100
     parent = kb.create_task(conn, title="parent publication", assignee="developer")
     claimed = kb.claim_task(conn, parent)
     developer_run = claimed.current_run_id
+    clock["now"] = now - 98
+    child = kb.create_task(conn, title="follow-up", assignee="developer")
+    kb.link_tasks(conn, parent, child)
+    if early_comment:
+        clock["now"] = now - 95
+        kb.add_comment(conn, child, author="developer", body=f"Parent publication: {PARENT_PR}.")
+    if check_pending:
+        assert kb.get_task(conn, parent).status == "running"
+        _assert_guard_and_tick(conn, child, allowed=False)
+        assert clock["calls"] == []
     clock["now"] = now - 90
     assert kb.request_review(conn, parent, reviewer="devops", summary="Published for review",
                              metadata={"published_pr": PARENT_PR, "head": HEAD},
@@ -63,16 +99,51 @@ def _native_parent(conn, clock):
     clock["now"] = now - 80
     reviewed = kb.claim_review_task(conn, parent)
     review_run = reviewed.current_run_id
+    if check_pending:
+        _assert_guard_and_tick(conn, child, allowed=False)
+        assert clock["calls"] == []
     clock["now"] = now - 70
     assert kb.complete_task(conn, parent, summary="Independently reviewed and merged",
                             metadata={"review_outcome": "approved_and_merged_dev", "published_pr": PARENT_PR,
                                       "head": HEAD, "merge_commit": MERGE},
                              expected_run_id=review_run)
-    clock["now"] = now - 60
-    child = kb.create_task(conn, title="follow-up", assignee="developer")
-    kb.link_tasks(conn, parent, child)
     clock["now"] = now
     return parent, child, developer_run, review_run
+
+
+@pytest.mark.parametrize("scenario", [
+    "valid", "completion_tie", "completion_future", "child_comment_tie", "comment_future",
+    "open", "own", "mixed", "bad_review_metadata", "bad_developer_metadata", "bad_handoff",
+])
+def test_pre_review_child_comment_requires_completed_parent_at_evaluation(github, scenario):
+    with connect() as conn:
+        parent, child, developer_run, review_run = _native_parent(
+            conn, github, early_comment=True, check_pending=scenario == "valid")
+        now = github["now"]
+        mutations = {
+            "completion_tie": ("UPDATE task_runs SET ended_at=? WHERE id=?", (now, review_run)),
+            "completion_future": ("UPDATE task_runs SET ended_at=? WHERE id=?", (now + 1, review_run)),
+            "child_comment_tie": ("UPDATE tasks SET created_at=? WHERE id=?", (now - 95, child)),
+            "comment_future": ("UPDATE task_comments SET created_at=? WHERE task_id=?", (now + 1, child)),
+            "bad_review_metadata": ("UPDATE task_runs SET metadata='[null]' WHERE id=?", (review_run,)),
+            "bad_developer_metadata": ("UPDATE task_runs SET metadata='[null]' WHERE id=?", (developer_run,)),
+            "bad_handoff": ("UPDATE task_events SET payload='not-json' WHERE task_id=? "
+                            "AND kind='review_requested'", (parent,)),
+            "own": ("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome,metadata) "
+                    "VALUES (?,'developer','review',?,?,'review_requested',?)",
+                    (child, now - 50, now - 40, json.dumps({"published_pr": PARENT_PR, "head": HEAD}))),
+            "mixed": ("UPDATE task_comments SET body=? WHERE task_id=?", (PARENT_PR + " " + OWN_PR, child)),
+        }
+        with kb.write_txn(conn):
+            conn.execute(*mutations.get(scenario, ("SELECT 1", ())))
+        if scenario == "open":
+            github["pr"]["state"] = "open"
+        allowed = scenario == "valid"
+        result = _assert_guard_and_tick(conn, child, allowed=allowed)
+        if not allowed:
+            assert dict(result.respawn_guarded)[child] == "active_pr"
+        reads = {"valid": 1, "mixed": 1, "open": 2}.get(scenario, 0)
+        assert github["calls"] == ["synthetic-developer"] * reads
 
 
 @pytest.mark.parametrize("punctuation", [".", ",", ";", ":", "!"])
@@ -239,7 +310,7 @@ def test_parent_exception_preserves_url_handoff_and_dispatch_contracts(github, m
                 with kb.write_txn(conn):
                     conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (profile, child))
                 assert dispatch.check_respawn_guard(conn, child) is None
-            assert github["calls"] == ["synthetic-developer", "synthetic-closer", "synthetic-developer"]
+            assert github["calls"] == ["synthetic-closer", "synthetic-developer"]
         if scenario in {"url_suffix", "url_query", "http", "different_case", "missing_profile", "same_second_handoff",
                         "own_publication_same_url", "future_comment"}:
             assert github["calls"] == []
@@ -248,3 +319,152 @@ def test_parent_exception_preserves_url_handoff_and_dispatch_contracts(github, m
         assert (child in [task_id for task_id, _, _ in result.spawned]) is allowed
         if not allowed and scenario != "missing_profile":
             assert dict(result.respawn_guarded)[child] == "active_pr"
+
+
+@pytest.mark.parametrize("scenario", [
+    "repeated", "head", "merge", "review_receipt", "developer_receipt", "handoff_receipt",
+    "invalid_receipt", "own", "mixed", "new_run", "profile", "credentials", "scope",
+    "ttl", "ttl_timeout", "ttl_auth", "ttl_open", "ttl_malformed", "boards", "bounded",
+])
+def test_verified_receipts_recheck_local_evidence_and_scope_remote_permission(github, tmp_path, monkeypatch, scenario):
+    with connect() as conn:
+        parent, child, developer_run, review_run = _native_parent(conn, github, early_comment=True)
+        _assert_tick_reads(conn, child, github, reads=1)
+        # Neither repeated guard calls nor whole ticks slide the original TTL.
+        for _ in range(3):
+            github["monotonic"] += parent_pr._VERIFIED_PR_TTL_SECONDS / 4
+            _assert_tick_reads(conn, child, github)
+        if scenario == "repeated":
+            assert github["calls"] == ["synthetic-developer"]
+            return
+
+        if scenario in {"head", "merge", "review_receipt", "developer_receipt", "handoff_receipt"}:
+            updates = {
+                "head": (review_run, {"head": "c" * 40}),
+                "merge": (review_run, {"merge_commit": "d" * 40}),
+                "review_receipt": (review_run, {"note": "synthetic-private-context"}),
+                "developer_receipt": (developer_run, {"note": "synthetic-private-context"}),
+            }
+            if scenario == "handoff_receipt":
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='review_requested'",
+                                 (json.dumps({"implementer": "developer", "reviewer": "devops",
+                                              "summary": "synthetic-private-context"}), parent))
+            else:
+                _update_run_metadata(conn, *updates[scenario])
+            if scenario in {"head", "merge"}:
+                if scenario == "head":
+                    _update_run_metadata(conn, developer_run, {"head": "c" * 40})
+                # A valid but different native SHA must not reuse the old proof.
+                _assert_tick_reads(conn, child, github, allowed=False, reads=2)
+                github["pr"].update({"head": {"sha": "c" * 40}} if scenario == "head" else
+                                    {"merge_commit_sha": "d" * 40})
+            _assert_tick_reads(conn, child, github, reads=1)
+            cached = repr(parent_pr._VERIFIED_PRS)
+            assert "synthetic-private-context" not in cached
+            assert "synthetic-developer" not in cached
+            return
+
+        if scenario in {"invalid_receipt", "own", "mixed", "new_run"}:
+            original = conn.execute("SELECT metadata FROM task_runs WHERE id=?", (review_run,)).fetchone()[0]
+            mutations = {
+                "invalid_receipt": ("UPDATE task_runs SET metadata='not-json' WHERE id=?", (review_run,)),
+                "own": ("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome,metadata) "
+                        "VALUES (?,'developer','review',?,?,'review_requested',?)",
+                        (child, github["now"] - 50, github["now"] - 40,
+                         json.dumps({"published_pr": PARENT_PR, "head": HEAD}))),
+                "mixed": ("UPDATE task_comments SET body=? WHERE task_id=?", (PARENT_PR + " " + OWN_PR, child)),
+                "new_run": ("INSERT INTO task_runs (task_id,profile,status,started_at) VALUES (?,'devops','running',?)",
+                            (parent, github["now"])),
+            }
+            with kb.write_txn(conn):
+                changed = conn.execute(*mutations[scenario]).lastrowid
+            _assert_tick_reads(conn, child, github, allowed=False)
+            restorations = {
+                "invalid_receipt": ("UPDATE task_runs SET metadata=? WHERE id=?", (original, review_run)),
+                "own": ("DELETE FROM task_runs WHERE id=?", (changed,)),
+                "mixed": ("UPDATE task_comments SET body=? WHERE task_id=?", (PARENT_PR, child)),
+                "new_run": ("DELETE FROM task_runs WHERE id=?", (changed,)),
+            }
+            with kb.write_txn(conn):
+                conn.execute(*restorations[scenario])
+            _assert_tick_reads(conn, child, github, reads=0 if scenario == "mixed" else 1)
+            return
+
+        if scenario.startswith("ttl"):
+            github["monotonic"] += parent_pr._VERIFIED_PR_TTL_SECONDS / 4
+            failures = {
+                "ttl_timeout": subprocess.TimeoutExpired("gh", 30),
+                "ttl_auth": subprocess.CalledProcessError(1, "gh", stderr="HTTP 403"),
+            }
+            github["error"] = failures.get(scenario)
+            original = github["pr"]
+            if scenario in {"ttl_open", "ttl_malformed"}:
+                github["pr"] = {**original, "state": "open"} if scenario == "ttl_open" else []
+            if scenario != "ttl":
+                # An expired success cannot override an unavailable/different API
+                # response, nor may an error become permission on the next tick.
+                for _ in range(2):
+                    _assert_tick_reads(conn, child, github, allowed=False, reads=2)
+                github["error"], github["pr"] = None, original
+            _assert_tick_reads(conn, child, github, reads=1)
+            _assert_tick_reads(conn, child, github)
+            return
+
+        if scenario == "profile":
+            for profile, reads in (("developer", 0), ("closer", 1), ("developer", 1)):
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (profile, child))
+                _assert_tick_reads(conn, child, github, reads=reads)
+            assert github["calls"] == ["synthetic-developer", "synthetic-closer", "synthetic-developer"]
+            return
+
+        if scenario == "credentials":
+            home = Path(acceptance._assignee_profile_home("developer"))
+            (home / ".env").write_text("GH_TOKEN=synthetic-rotated\n")
+            _assert_tick_reads(conn, child, github, reads=1)
+            assert github["calls"][-1] == "synthetic-rotated"
+            return
+
+        if scenario == "scope":
+            from agent import secret_scope
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            db_path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+            monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+            was_active = secret_scope.is_multiplex_active()
+            secret_scope.set_multiplex_active(True)
+            try:
+                for name in ("developer", "closer", "developer"):
+                    home = Path(acceptance._assignee_profile_home(name))
+                    home_token = set_hermes_home_override(str(home))
+                    secrets = secret_scope.build_profile_secret_scope(home)
+                    secret_token = secret_scope.set_secret_scope(secrets, profile_home=str(home))
+                    try:
+                        _assert_tick_reads(conn, child, github, reads=1)
+                    finally:
+                        secret_scope.reset_secret_scope(secret_token)
+                        reset_hermes_home_override(home_token)
+            finally:
+                secret_scope.set_multiplex_active(was_active)
+            # The scoped caller changed, but authentication always belongs to the
+            # child's assignee, never the ambient launch/closer token.
+            assert github["calls"] == ["synthetic-developer"] * 4
+            return
+
+        # Clone exact IDs, timestamps and native receipts into a distinct board:
+        # without DB identity in the key even a private-board auth failure leaks.
+        assert scenario in {"boards", "bounded"}
+        if scenario == "bounded":
+            monkeypatch.setattr(parent_pr, "_VERIFIED_PR_CACHE_LIMIT", 1)
+        source = Path(next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"))
+        with connect(tmp_path / "other-board.db") as other:
+            conn.backup(other)
+            monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "other-board.db"))
+            github["error"] = subprocess.CalledProcessError(1, "gh", stderr="HTTP 403")
+            _assert_tick_reads(other, child, github, allowed=False, reads=2)
+            github["error"] = None
+            _assert_tick_reads(other, child, github, reads=1)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(source))
+        _assert_tick_reads(conn, child, github, reads=1 if scenario == "bounded" else 0)
+        assert len(parent_pr._VERIFIED_PRS) <= parent_pr._VERIFIED_PR_CACHE_LIMIT
