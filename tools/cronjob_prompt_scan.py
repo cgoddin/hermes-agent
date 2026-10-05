@@ -39,6 +39,27 @@ _CRON_THREAT_PATTERNS = [
 # are vetted at install time — only unambiguous injection directives remain.
 _CRON_SKILL_ASSEMBLED_PATTERNS = _CRON_THREAT_PATTERNS[:4]
 
+# An evidence-limited operational diagnosis is not an instruction to conceal a fact:
+# "do not tell the user <resource> is missing based only on <observation>" restricts
+# what can be concluded from that observation. Recognize the whole local clause,
+# not a skill name, command, or the mere presence of "if"/"unless" nearby. Unknown
+# shapes remain blocked. In particular, a disclosure condition ("unless they ask")
+# or a second imperative must not masquerade as the observation noun phrase.
+_CRON_DECEPTION_RE = re.compile(_CRON_THREAT_PATTERNS[1][0], re.IGNORECASE)
+_EVIDENCE_WORD = (
+    r'(?!(?:and|but|or|if|unless|until|when|even|despite|although|do|not|never|tell)\b)'
+    r'[\w-]+'
+)
+_EVIDENCE_OBSERVATION = rf'(?:{_EVIDENCE_WORD}|`{_EVIDENCE_WORD}(?:[ \t]+{_EVIDENCE_WORD}){{0,7}}`)'
+_CRON_EPISTEMIC_STATUS_RE = re.compile(
+    r'\s+(?:that\s+)?(?:a|an|the|your)\s+'
+    r'(?:[\w-]+\s+){1,6}(?:is|are)\s+(?:missing|unavailable|misconfigured)\s+'
+    r'based\s+(?:only|solely)\s+on\s+'
+    rf'{_EVIDENCE_OBSERVATION}(?:[ \t]+{_EVIDENCE_OBSERVATION}){{0,11}}'
+    r'[ \t]*(?=[.!?;]|$|\r?\n[ \t]*(?:\r?\n|$))',
+    re.IGNORECASE,
+)
+
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
 # Obvious leak paths only: secret in the destination URL, in a POST/form body, or in an
 # Authorization header to an arbitrary host.
@@ -141,4 +162,12 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
             "char(s) (%s) from vetted skill content",
             len(removed), ", ".join(removed),
         )
-    return cleaned, _first_pattern_error(_strip_cron_safe_constructs(cleaned), _CRON_SKILL_ASSEMBLED_PATTERNS)
+    text = _strip_cron_safe_constructs(cleaned)
+    # Mask ONLY the matched speech directive in the scan copy. All other bytes,
+    # including other directives in the same sentence, still reach the tripwire;
+    # the actual prompt retains the evidence guidance unchanged.
+    text = _CRON_DECEPTION_RE.sub(
+        lambda match: ' ' if _CRON_EPISTEMIC_STATUS_RE.match(text, match.end()) else match.group(),
+        text,
+    )
+    return cleaned, _first_pattern_error(text, _CRON_SKILL_ASSEMBLED_PATTERNS)
