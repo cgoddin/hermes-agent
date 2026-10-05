@@ -83,7 +83,7 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+(?:(?:[/?#A-Za-z]|\.[A-Za-z])[^\s<>\"')\]]*)?",
     re.IGNORECASE,
 )
 
@@ -1544,7 +1544,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1620,26 +1620,42 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
+    #    An authenticated, independently merged parent PR is context, not this
+    #    card's publication. Every other URL still guards, even in the same comment.
+    #    Exception: a handoff AFTER the newest blocking PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    from hermes_cli.kanban_db_parent_pr import is_merged_parent_pr
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    merged_parents: dict[tuple[str, int], bool] = {}
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        urls = _RESPAWN_GUARD_PR_URL_RE.findall(body) if body else []
+        if urls and c["created_at"] > now:
+            return "active_pr"
+        blocking = False
+        for url in urls:
+            key = (url, c["created_at"])
+            if key not in merged_parents:
+                merged_parents[key] = is_merged_parent_pr(
+                    conn, task_id, url, row["assignee"], created_at=c["created_at"], now=now)
+            if not merged_parents[key]:
+                blocking = True
+        if not blocking:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
+            "WHERE task_id = ? AND created_at > ? AND created_at <= ? "
             "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            (task_id, int(c["created_at"] or 0), now),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
