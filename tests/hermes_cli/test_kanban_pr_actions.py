@@ -511,3 +511,78 @@ def test_registration_cannot_change_or_supply_post_evaluation_expectations(githu
             count = calls.read_text() if calls.exists() else ""
             assert kb.complete_task(conn, tid, summary="Local result")
             assert (calls.read_text() if calls.exists() else "") == count
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("surface", ["db", "cli", "tool"])
+@pytest.mark.parametrize("fault", [None, "python-job-skipped", "python-step-skipped", "run-failed", "run-pending",
+                                       "external-required", "optional-wrong-attempt", "incomplete-jobs"])
+def test_optional_skipped_jobs_do_not_replace_frozen_python_acceptance(github, surface, fault):
+    from tools import kanban_tools  # noqa: F401 - native registry dispatch
+    from tools.registry import registry
+
+    routes, run, job, save, calls = github
+    spec = copy.deepcopy(SPEC)
+    expected = spec["workflows"][0]["jobs"][0]
+    expected.update(name="Python tests", steps=["Run Python tests"])
+    job["name"] = expected["name"]
+    job["steps"][0]["name"] = expected["steps"][0]
+    policy = routes[f"repos/{REPO}/branches/main/protection"]["required_status_checks"]
+    policy["contexts"] = [expected["name"]]
+    policy["checks"] = [{"context": expected["name"], "app_id": 15368}]
+    optional = [{"id": 71 + i, "name": name, "run_id": run["id"], "run_attempt": run["run_attempt"],
+                 "head_sha": SHA, "status": "completed", "conclusion": "skipped", "steps": []}
+                for i, name in enumerate(("Conditional TypeScript build", "Conditional docs build"))]
+    # Required Python evidence is on a later page than the conditional skips.
+    pages = [{"total_count": 3, "jobs": optional}, {"total_count": 3, "jobs": [job]}]
+    routes[f"repos/{REPO}/actions/runs/50/attempts/2/jobs?per_page=100"] = pages
+    if fault == "python-job-skipped":
+        job["conclusion"] = "skipped"
+    if fault == "python-step-skipped":
+        job["steps"][0]["conclusion"] = "skipped"
+    if fault == "run-failed":
+        run["conclusion"] = "failure"
+    if fault == "run-pending":
+        run.update(status="in_progress", conclusion=None)
+    if fault == "external-required":
+        # A non-declared job may still be repository-required. Its policy gate
+        # is not waived just because conditional skips are permitted by the spec.
+        policy["checks"].append({"context": optional[0]["name"], "app_id": 123})
+    if fault == "optional-wrong-attempt":
+        optional[0]["run_attempt"] = 1
+    if fault == "incomplete-jobs":
+        pages.pop()
+    save()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Conditional CI", assignee="default", completion_contract=PR, acceptance_spec=spec)
+    if surface == "cli":
+        output = cli.run_slash(f"complete {tid} --summary 'Python verified' --metadata " + shlex.quote(json.dumps({"published_pr": PR})))
+        accepted = "Completed" in output
+    elif surface == "tool":
+        output = json.loads(registry.dispatch("kanban_complete", {
+            "task_id": tid, "summary": "Python verified", "metadata": {"published_pr": PR}}))
+        accepted = output.get("ok", False)
+    else:
+        with connect() as conn:
+            accepted = kb.complete_task(conn, tid, summary="Python verified", metadata={"published_pr": PR})
+    assert accepted is (fault is None)
+    with connect() as conn:
+        assert (kb.get_task(conn, tid).status == "done") is accepted
+        assert json.loads(kb.get_task(conn, tid).acceptance_spec) == spec
+        receipt = [e.payload for e in kb.list_events(conn, tid) if e.kind == "pr_acceptance"][-1]
+        assert receipt["ok"] is accepted and receipt["head_sha"] == SHA
+        if fault in {"python-job-skipped", "python-step-skipped"}:
+            python = next(c for c in receipt["checks"] if c.get("name") == expected["name"])
+            skipped = python if fault == "python-job-skipped" else python["steps"][0]
+            assert skipped["conclusion"] == "skipped" and skipped["classification"] == "failure"
+        if fault in {"run-failed", "run-pending"}:
+            assert receipt["checks"][0]["classification"] == ("failure" if fault == "run-failed" else "pending")
+        if fault == "external-required":
+            assert receipt["classification"] == "auth"
+        if accepted:
+            assert receipt["classification"] == "success"
+            assert all(c["classification"] == "success" for c in receipt["checks"])
+            requests = [json.loads(line) for line in calls.read_text().splitlines()]
+            assert all("/check-runs" not in r[1] and r[1] != "graphql" for r in requests)
+            jobs_request = next(r for r in requests if "/jobs?" in r[1])
+            assert jobs_request[-2:] == ["--paginate", "--slurp"]

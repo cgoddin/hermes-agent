@@ -173,13 +173,12 @@ def collect_actions(api, spec, repo, number, receipt):
                                   "head_sha": sha, "classification": outcome,
                                   "url": _action_url(repo, rid, attempt),
                                   "conclusion": _conclusion(run["conclusion"])})
-        # Inspect every returned job, not just the first page or a workflow's
-        # rolled-up conclusion (which can be green when a job was skipped).
+        # Validate provenance on every page, including conditional jobs. Only
+        # frozen required jobs/steps need success; the aggregate run still must
+        # succeed, and repository-required contexts retain their policy gates.
         for job in jobs:
             if job["run_id"] != rid or job["run_attempt"] != attempt or job["head_sha"] != sha:
                 raise ValueError("Wrong job attempt/head")
-            if not _success(job):
-                outcomes.append("failure")
         for expected in workflow["jobs"]:
             matches = [j for j in jobs if j["name"] == expected["name"]]
             if len(matches) != 1:
