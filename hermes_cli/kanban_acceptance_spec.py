@@ -1,4 +1,4 @@
-"""Creation-time, versioned CI expectations; never inferred from completion prose."""
+"""Frozen CI expectations declared at creation or explicit pre-evaluation registration."""
 from __future__ import annotations
 
 import json

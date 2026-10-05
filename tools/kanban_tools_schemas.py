@@ -60,6 +60,20 @@ KANBAN_SHOW_SCHEMA = _schema(
     [],
 )
 
+KANBAN_REGISTER_ACCEPTANCE_SCHEMA = _schema(
+    "kanban_register_acceptance",
+    "Orchestrator-only once-only registration of frozen Actions expectations for an existing PR task, before any acceptance evaluation. "
+    "Requires a versioned task/project contract snapshot; cannot replace expectations or override completion metadata.",
+    {
+        "task_id": _prop("string", "Existing unevaluated PR task id."),
+        "contract": _prop("object", "Version 1 snapshot: source={kind: task or project, id: task/linked-project id, revision: positive integer}, "
+                          "acceptance_spec={version:1,repo,base_branch,workflows:[{path,id,event,jobs:[{name,steps}]}]}. Persisted and audited, not CI evidence."),
+        "published_pr": _prop("string", "Exact GitHub PR URL, required if the persisted completion contract is OWNER/REPO; repo/base are verified."),
+    },
+    ["task_id", "contract"],
+)
+
+
 KANBAN_LIST_SCHEMA = _schema(
     "kanban_list",
     (

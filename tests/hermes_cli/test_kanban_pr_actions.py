@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -333,3 +334,180 @@ def test_cli_tool_completion_share_gate_but_review_handoff_does_not(github, monk
         for change in ({"version": 2}, {"repo": "other/repo"}, {"workflows": []}):
             with pytest.raises(ValueError):
                 kb.create_task(conn, title="invalid", completion_contract=REPO, acceptance_spec={**SPEC, **change})
+
+
+def _register_surface(surface, tid, contract, pr=PR):
+    from hermes_cli.kanban_acceptance_registration import register_acceptance
+    if surface == "cli":
+        command = f"register-acceptance {tid} --contract {shlex.quote(json.dumps(contract))} --json"
+        if pr is not None:
+            command += " --pr " + shlex.quote(pr)
+        output = cli.run_slash(command)
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": output}
+    if surface == "tool":
+        from tools import kanban_tools  # noqa: F401
+        from tools.registry import registry
+        return json.loads(registry.dispatch("kanban_register_acceptance", {
+            "task_id": tid, "contract": contract, "published_pr": pr}))
+    try:
+        with connect() as conn:
+            return register_acceptance(conn, tid, contract, published_pr=pr)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("surface", ["db", "cli", "tool"])
+@pytest.mark.parametrize("origin", ["task", "project", "migrated"])
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+def test_existing_cards_register_audited_contract_before_real_completion(github, surface, origin, conclusion, tmp_path):
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import projects_db
+    routes, run, job, save, calls = github
+    project_id = None
+    if origin == "project":
+        with projects_db.connect_closing() as projects:
+            project_id = projects_db.create_project(projects, name="Acceptance project", primary_path=str(tmp_path / "repo"))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Existing PR card", completion_contract=REPO, project_id=project_id)
+        assert kb.get_task(conn, tid).acceptance_spec is None
+        if origin == "migrated":
+            conn.execute("ALTER TABLE tasks DROP COLUMN acceptance_spec")
+    conn.close()
+    if origin == "migrated":
+        kbc._INITIALIZED_PATHS.clear()
+        with connect() as migrated:
+            assert kb.get_task(migrated, tid).acceptance_spec is None
+            assert kb.get_task(migrated, tid).title == "Existing PR card"
+    contract = {"version": 1, "source": {"kind": "project" if origin == "project" else "task",
+                "id": project_id or tid, "revision": 3}, "acceptance_spec": copy.deepcopy(SPEC)}
+    save()
+    landed = _register_surface(surface, tid, contract)
+    assert landed.get("ok"), landed
+    with connect() as conn:
+        frozen = kb.get_task(conn, tid).acceptance_spec
+        assert json.loads(frozen) == SPEC
+        assert kb.get_task(conn, tid).completion_contract == PR
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "acceptance_spec_registered")
+        canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+        assert event.payload["contract"] == contract
+        assert event.payload["contract_digest"] == hashlib.sha256(canonical.encode()).hexdigest()
+        assert event.payload["spec_digest"] == landed["spec_digest"] == hashlib.sha256(frozen.encode()).hexdigest()
+        assert event.payload["actor"] and event.payload["base_branch"] == SPEC["base_branch"]
+    before = calls.read_text()
+    # Even identical repeat registration is rejected without fetching evidence.
+    assert not _register_surface(surface, tid, contract).get("ok", False)
+    contract["acceptance_spec"]["workflows"][0]["jobs"][0]["steps"] = ["Anything green"]
+    assert not _register_surface(surface, tid, contract).get("ok", False)
+    assert calls.read_text() == before
+    run["conclusion"] = conclusion
+    save()
+    with connect() as conn:
+        accepted = kb.complete_task(conn, tid, summary="Ready", metadata={"published_pr": PR, "acceptance_spec": contract["acceptance_spec"]})
+        assert accepted is (conclusion == "success")
+        assert (kb.get_task(conn, tid).status == "done") is accepted
+        assert kb.get_task(conn, tid).acceptance_spec == frozen
+        receipts = [e.payload for e in kb.list_events(conn, tid) if e.kind == "pr_acceptance"]
+        assert receipts[-1]["spec_digest"] == landed["spec_digest"]
+        assert receipts[-1]["ok"] is accepted
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == "acceptance_spec_registered"]) == 1
+    requests = [json.loads(line)[1] for line in calls.read_text().splitlines()]
+    assert "graphql" not in requests
+    if conclusion == "success":
+        assert not any("/check-runs" in r for r in requests)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("surface", ["db", "cli", "tool"])
+@pytest.mark.parametrize("fault", [
+    "missing-contract", "local-only", "no-snapshot", "no-source", "wrong-task", "wrong-project", "bad-revision", "bad-version",
+    "wrong-repo", "wrong-base", "wrong-pr", "no-pr", "empty-expectations", "creation-frozen", "terminal", "worker",
+    "historical-evaluation", "after-evaluation", "evaluation-in-flight", "registration-race",
+    "wrong-remote-repo", "wrong-remote-base", "api-denied",
+])
+def test_registration_cannot_change_or_supply_post_evaluation_expectations(github, surface, fault, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_acceptance_registration import register_acceptance
+    from hermes_cli.kanban_db_connect import write_txn
+    routes, run, job, save, calls = github
+    save()
+    with connect() as conn:
+        declaration = "local-only" if fault == "local-only" else REPO
+        tid = kb.create_task(conn, title="Registration refusal", completion_contract=declaration,
+                             acceptance_spec=SPEC if fault == "creation-frozen" else None)
+        if fault == "missing-contract":
+            with write_txn(conn):
+                conn.execute("UPDATE tasks SET completion_contract=NULL WHERE id=?", (tid,))
+        if fault == "terminal":
+            with write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        if fault == "historical-evaluation":
+            with write_txn(conn):
+                kb._append_event(conn, tid, "pr_acceptance", {"ok": False, "classification": "auth"})
+    contract = {"version": 1, "source": {"kind": "task", "id": tid, "revision": 1}, "acceptance_spec": copy.deepcopy(SPEC)}
+    changes = {
+        "wrong-task": (contract["source"], "id", "t_other"),
+        "wrong-project": (contract["source"], "kind", "project"),
+        "bad-revision": (contract["source"], "revision", 0),
+        "bad-version": (contract, "version", 2),
+        "wrong-repo": (contract["acceptance_spec"], "repo", "other/repo"),
+        "wrong-base": (contract["acceptance_spec"], "base_branch", "dev"),
+        "empty-expectations": (contract["acceptance_spec"], "workflows", []),
+    }
+    if fault in changes:
+        row, key, value = changes[fault]
+        row[key] = value
+    if fault == "no-source":
+        contract.pop("source")
+    if fault == "no-snapshot":
+        contract = None
+    if fault == "worker":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if fault == "wrong-remote-repo":
+        routes[f"repos/{REPO}/pulls/7"]["base"]["repo"]["full_name"] = "other/repo"
+        save()
+    if fault == "wrong-remote-base":
+        routes[f"repos/{REPO}/pulls/7"]["base"]["ref"] = "dev"
+        save()
+    if fault == "api-denied":
+        routes[f"repos/{REPO}/pulls/7"] = {"deny": True}
+        save()
+    if fault in {"after-evaluation", "evaluation-in-flight"}:
+        real_api = acceptance._api
+        def during_evaluation(endpoint, **kwargs):
+            if endpoint == "graphql":
+                with connect() as rival:
+                    with pytest.raises(ValueError, match="evaluation has already begun"):
+                        register_acceptance(rival, tid, contract, published_pr=PR)
+            return real_api(endpoint, **kwargs)
+        if fault == "evaluation-in-flight":
+            monkeypatch.setattr(acceptance, "_api", during_evaluation)
+        with connect() as conn:
+            # Completion metadata cannot register a snapshot or downgrade the
+            # legacy gate; the fixture refuses its GraphQL read.
+            assert not kb.complete_task(conn, tid, summary="done", metadata={"published_pr": PR, "acceptance_spec": SPEC})
+            assert kb.get_task(conn, tid).acceptance_spec is None
+            assert any(e.kind == "pr_acceptance_started" for e in kb.list_events(conn, tid))
+    if fault == "registration-race":
+        real_api = acceptance._api
+        def evaluation_wins(endpoint, **kwargs):
+            if "/pulls/" in endpoint:
+                with connect() as rival:
+                    assert not kb.complete_task(rival, tid, summary="done", metadata={"published_pr": PR})
+            return real_api(endpoint, **kwargs)
+        monkeypatch.setattr(acceptance, "_api", evaluation_wins)
+    pr = "https://github.com/other/repo/pull/7" if fault == "wrong-pr" else None if fault == "no-pr" else PR
+    refused = _register_surface(surface, tid, contract, pr)
+    assert not refused.get("ok", False), refused
+    assert "dummy-secret" not in json.dumps(refused)
+    with connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert (task.acceptance_spec is not None) is (fault == "creation-frozen")
+        assert not any(e.kind == "acceptance_spec_registered" for e in kb.list_events(conn, tid))
+        if fault in {"missing-contract", "local-only"}:
+            count = calls.read_text() if calls.exists() else ""
+            assert kb.complete_task(conn, tid, summary="Local result")
+            assert (calls.read_text() if calls.exists() else "") == count

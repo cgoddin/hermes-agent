@@ -11,6 +11,7 @@ def _snapshot(conn, task_id):
 
 
 def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+    from hermes_cli.kanban_db import _append_event
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
@@ -22,13 +23,16 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
-        with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
-                return False
+    with write_txn(conn):
+        if _snapshot(conn, task_id) != snapshot:
+            return False
+        if match and contract == match[1]:
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr, spec)
-        contract = published_pr
+            snapshot = (run_id, status, published_pr, spec)
+            contract = published_pr
+        # Close registration BEFORE network work. A failed/crashed read or an
+        # ownership race must not reopen the expectations-declaration window.
+        _append_event(conn, task_id, "pr_acceptance_started", {"completion_contract": contract}, run_id=run_id)
     # The assignee profile's gh login owns the repo: acceptance must not run as
     # the ambient login of whichever process completes the card (#122689).
     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
