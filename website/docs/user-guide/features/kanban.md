@@ -65,7 +65,7 @@ neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
 checks needs a local-only contract. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
-Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /
+Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` / `GITHUB_TOKEN` /
 `GH_CONFIG_DIR` from the profile's own `.env`, never the ambient login of the
 process completing the card. On multi-profile hosts (one GitHub identity per
 org), sign `gh` in per profile (`GH_CONFIG_DIR` in that profile's `.env`). The
@@ -75,7 +75,7 @@ token must live in the profile's `.env` (or a configured secret source): a
 own — or one that no longer exists — is refused `not logged in` rather than
 falling through to `~/.config/gh`; unassigned cards still use the ambient
 login. A login that cannot see the repository is rejected with
-`classification=auth`, naming the profile and repository, instead of a
+`classification=auth`, naming the sanitized profile and API phase, instead of a
 retryable infra failure.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
@@ -93,6 +93,58 @@ transaction or a continuous post-completion monitor. This is a single-user lifec
 guard, not OS isolation against arbitrary direct database writes. GitHub Enterprise
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
+
+### Operator procedure: `wm-auth` publication and independent CI review
+
+`wm-auth` is an existing CLI wrapper binary, **not a Hermes profile**. Select the
+executing profile explicitly as its first argument. The wrapper target must match
+that worker's `HERMES_PROFILE` and resolved `HERMES_HOME`: use `developer` in the
+developer's own environment and `devops` in the independent DevOps environment.
+If they do not match, stop rather than relabel the environment or borrow another
+profile's identity. Read-only developer diagnostics:
+
+```bash
+wm-auth developer gh api user --jq .login
+wm-auth developer git -C TASK_WORKTREE status --short --branch
+```
+
+Match the card's assignee, persisted completion contract, worktree, and intended
+GitHub account before publication. Use the explicit own-profile wrapper for both
+`gh` and `git`, not an ambient shell token or another profile's cached login. A
+`GITHUB_TOKEN`-only profile must not borrow an ambient `GH_TOKEN` (which `gh`
+otherwise prefers). A Git author name is not proof of the authenticated
+publishing account. Never print tokens, dump the environment,
+use `gh auth token`, trace credential-bearing commands, or attach raw stderr,
+headers, credential files, or token-bearing URLs to a card.
+
+**CLI publication is a separate handoff, not CI acceptance.** When publication is
+explicitly authorized, record the matching PR URL and head SHA for an independent
+DevOps review. DevOps must verify repository-required contexts and app identities
+at that exact head, complete pagination, and recheck head/base before completion.
+In the matching DevOps worker environment, start with its own identity:
+
+```bash
+wm-auth devops gh api user --jq .login
+wm-auth devops git -C TASK_WORKTREE status --short --branch
+```
+
+A created PR, local green tests, or an optional successful Actions run cannot
+replace that gate. Separately, Hermes's native acceptance reader resolves the
+card's **assignee credentials** itself; it does not borrow the wrapper's selected
+reviewer identity or ambient login. A refusal under the assignee's credentials
+must be resolved for that assignee, never retried through a different profile to
+obtain acceptance.
+
+Known GraphQL `FORBIDDEN`, `UNAUTHORIZED`, `NOT_FOUND`, or allowlisted permission
+denials are `auth`, including HTTP-200 error bodies and `gh` exit-1 diagnostics.
+HTTP 401/403/404 are also `auth`; unknown GraphQL and transport failures remain
+`infra`. Fixing the GraphQL diagnosis does **not** resolve a Checks REST 403 or
+prove that required-check policy exists. A REST refusal leaves evidence unreadable;
+an empty required policy leaves the PR contract unsatisfied. Keep the card open or
+block for the responsible operator. Do not substitute permissive REST/Actions
+fallbacks, another profile's login, stale checks, or a `local-only` downgrade for
+required CI. These diagnostics authorize no upstream push, installation, live
+runtime update, or credential/policy changes.
 
 ## Kanban vs. `delegate_task`
 

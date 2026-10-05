@@ -18,6 +18,70 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_GRAPHQL_AUTH_CODES = frozenset({"FORBIDDEN", "UNAUTHORIZED", "NOT_FOUND"})
+_GRAPHQL_PERMISSION_MESSAGES = frozenset({
+    "Resource not accessible by integration",
+    "Resource not accessible by personal access token",
+    "Insufficient permissions",
+})
+
+
+def _endpoint_label(endpoint: str) -> str:
+    # Never reflect a URL, repo/branch name, query, or header into a durable reason.
+    path = endpoint.split("?", 1)[0]
+    if path == "graphql":
+        return "graphql"
+    for pattern, label in (
+        (r"repos/[^/]+/[^/]+/rules/branches/[^/]+", "repos/<owner>/<repo>/rules/branches/<branch>"),
+        (r"repos/[^/]+/[^/]+/commits/[^/]+/(check-runs|statuses)", "repos/<owner>/<repo>/commits/<sha>/checks"),
+        (r"repos/[^/]+/[^/]+/pulls/[0-9]+", "repos/<owner>/<repo>/pulls/<number>"),
+    ):
+        if re.fullmatch(pattern, path):
+            return label
+    return "GitHub API"
+
+
+def _profile_label(assignee: str) -> str:
+    name = assignee.strip().lower() if isinstance(assignee, str) else ""
+    return repr(name) if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name) else "<invalid>"
+
+
+def _graphql_auth_reason(value) -> str | None:
+    errors = value.get("errors") if isinstance(value, dict) else None
+    if not isinstance(errors, list) or not errors:
+        return None
+    reasons = []
+    for error in errors:
+        if not isinstance(error, dict):
+            return None
+        extensions = error.get("extensions")
+        code = error.get("type") or (extensions.get("code") if isinstance(extensions, dict) else None)
+        if isinstance(code, str) and code in _GRAPHQL_AUTH_CODES:
+            reasons.append(code)
+        elif code is None and isinstance(error.get("message"), str) and error["message"] in _GRAPHQL_PERMISSION_MESSAGES:
+            reasons.append("permission denied")
+        else:
+            # Mixed/unknown failures remain incomplete evidence, not an auth diagnosis.
+            return None
+    return "GraphQL " + reasons[0]
+
+
+def _graphql_stderr_auth_reason(stderr: str) -> str | None:
+    # gh flattens GraphQL errors to lines. Match a whole diagnostic, never a code
+    # embedded in an attacker-controlled field/message, URL, or quoted payload.
+    reasons = []
+    for line in stderr.splitlines():
+        match = re.fullmatch(r"(?:gh: (?:GraphQL: )?|GraphQL: )(.+?)(?: \([A-Za-z0-9_.\[\]]+\))?", line)
+        if not match:
+            return None
+        message = match[1]
+        if message in _GRAPHQL_AUTH_CODES:
+            reasons.append(message)
+        elif message in _GRAPHQL_PERMISSION_MESSAGES:
+            reasons.append("permission denied")
+        else:
+            return None
+    return "GraphQL " + reasons[0] if reasons else None
 
 
 def validate_contract(value: str | None) -> str:
@@ -42,21 +106,36 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
     except subprocess.CalledProcessError as exc:
         # 401/403/404 = the login cannot see this repository (wrong profile identity
         # or missing grant), not a transient API failure. Persist only the status
-        # code + endpoint, never gh's stderr (credentials/host details).
+        # code + static endpoint label, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
-            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+            raise _GateAuthError(f"HTTP {denied[1]} on {_endpoint_label(endpoint)}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
-            raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
+            raise _GateAuthError(f"gh has no login for {_endpoint_label(endpoint)}") from None
+        if endpoint == "graphql" and exc.returncode == 1:
+            # gh api can emit the structured HTTP-200 error body before exiting 1.
+            # Prefer it to flattened stderr; unknown/mixed structured errors must
+            # not be relabelled by a suggestive string in a diagnostic.
+            try:
+                value = json.loads(exc.stdout or "")
+            except json.JSONDecodeError:
+                value = None
+            reason = (_graphql_auth_reason(value) if isinstance(value, dict) and value.get("errors")
+                      else _graphql_stderr_auth_reason(exc.stderr or ""))
+            if reason:
+                raise _GateAuthError(f"{reason} on graphql") from None
         raise
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
+        reason = _graphql_auth_reason(value) if endpoint == "graphql" else None
+        if reason:
+            raise _GateAuthError(f"{reason} on graphql") from None
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
 
 
 class _GateAuthError(RuntimeError):
-    """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
+    """gh was refused at HTTP 401/403/404 or a known GraphQL auth error:
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
 
@@ -101,7 +180,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
     try:
         return resolve_profile_env(normalize_profile_name(assignee))
     except (FileNotFoundError, ValueError):
-        raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
+        raise _GateAuthError(f"assignee profile {_profile_label(assignee)} cannot be resolved") from None
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
@@ -127,7 +206,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
-            raise _GateAuthError(f"HTTP 404 on graphql {repo}")
+            raise _GateAuthError("repository unavailable on graphql")
         pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
@@ -181,7 +260,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["ok"] = receipt["classification"] == "success"
         return receipt
     except _GateAuthError as exc:
-        login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+        login = f"assignee profile {_profile_label(assignee)}'s gh login" if assignee else "the ambient gh login"
         receipt.update(classification="auth",
                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
