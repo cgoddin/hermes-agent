@@ -45,6 +45,7 @@ _CRON_SKILL_ASSEMBLED_PATTERNS = _CRON_THREAT_PATTERNS[:4]
 # not a skill name, command, or the mere presence of "if"/"unless" nearby. Unknown
 # shapes remain blocked. In particular, a disclosure condition ("unless they ask")
 # or a second imperative must not masquerade as the observation noun phrase.
+# A colon can end the observation before its explanation; the explanation still scans.
 _CRON_DECEPTION_RE = re.compile(_CRON_THREAT_PATTERNS[1][0], re.IGNORECASE)
 _EVIDENCE_WORD = (
     r'(?!(?:and|but|or|if|unless|until|when|even|despite|although|do|not|never|tell)\b)'
@@ -56,7 +57,7 @@ _CRON_EPISTEMIC_STATUS_RE = re.compile(
     r'(?:[\w-]+\s+){1,6}(?:is|are)\s+(?:missing|unavailable|misconfigured)\s+'
     r'based\s+(?:only|solely)\s+on\s+'
     rf'{_EVIDENCE_OBSERVATION}(?:[ \t]+{_EVIDENCE_OBSERVATION}){{0,11}}'
-    r'[ \t]*(?=[.!?;]|$|\r?\n[ \t]*(?:\r?\n|$))',
+    r'[ \t]*(?=[.!?;:]|$|\r?\n[ \t]*(?:\r?\n|$))',
     re.IGNORECASE,
 )
 

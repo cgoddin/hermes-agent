@@ -146,7 +146,8 @@ class TestBuildJobPromptScansSkillContent:
     def test_kanban_auth_guidance_does_not_mask_concealment(self, cron_env, concealment):
         hermes_home, scheduler = cron_env
         fragment = (
-            "Do not tell the user a token or login is missing based only on bare gh auth status"
+            "Do not tell the user a token or login is missing based only on bare `gh auth status`: "
+            "it tests the current CLI context, not necessarily the authorized profile token."
         )
         _plant_skill(hermes_home, "kanban-auth-guidance", fragment + "\n\n" + concealment)
         job = {
